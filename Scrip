@@ -220,14 +220,20 @@ CURL_BASE_OPTS=(-sk)
 build_curl_base_opts() {
   CURL_BASE_OPTS=(-sk)
   [ -n "${PROXY:-}" ] && CURL_BASE_OPTS+=(--proxy "$PROXY")
+
   if [ -n "${BASIC_USER:-}" ] && [ -n "${BASIC_PASS:-}" ]; then
     CURL_BASE_OPTS+=(-u "${BASIC_USER}:${BASIC_PASS}")
   fi
+
   if [ -n "${COOKIE_STR:-}" ]; then
     CURL_BASE_OPTS+=(-b "$COOKIE_STR")
   fi
-  if [ "${#HEADERS[@]:-0}" -gt 0 ]; then
-    for h in "${HEADERS[@]}"; do CURL_BASE_OPTS+=(-H "$h"); done
+
+  # Correct array length check (no bad substitution)
+  if ((${#HEADERS[@]} > 0)); then
+    for h in "${HEADERS[@]}"; do
+      CURL_BASE_OPTS+=(-H "$h")
+    done
   fi
 }
 
