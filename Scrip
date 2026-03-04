@@ -1,0 +1,984 @@
+#!/usr/bin/env bash
+
+usage() {
+  cat <<'EOF'
+interactive_gobuster_flow.sh — interactive Gobuster workflow with auto wordlist discovery (Kali/SecLists)
+Includes: Scan ID prefixing, optional WAF-safe auto-throttle, seed crawling (robots/sitemap + optional katana/gospider).
+
+USAGE:
+  ./interactive_gobuster_flow.sh [OPTIONS]
+
+OPTIONS:
+  -h, --help              Show help and exit.
+  --id <ID>               Scan ID (prefix for all output files).
+  --target <url|host>     Target URL or hostname (if omitted, prompted).
+  --profile <p>           quick|balanced|thorough (if omitted, prompted; default balanced).
+  --non-interactive       Do not prompt (requires --target and --id; uses defaults unless overridden).
+
+OUTPUTS:
+  Creates a folder like:
+    gobuster_run_<ID>_YYYYMMDD_HHMMSS_<target>/
+  Every output file is prefixed with <ID>_ (e.g., <ID>_SUMMARY.txt, <ID>_dirs_ALL.txt, etc.)
+
+EOF
+}
+
+# -----------------------------
+# Arg parsing
+# -----------------------------
+ID_ARG=""
+TARGET_ARG=""
+PROFILE_ARG=""
+NONINTERACTIVE=0
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --id) ID_ARG="${2:-}"; shift 2 ;;
+    --target) TARGET_ARG="${2:-}"; shift 2 ;;
+    --profile) PROFILE_ARG="${2:-}"; shift 2 ;;
+    --non-interactive) NONINTERACTIVE=1; shift ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
+
+set -euo pipefail
+
+# -----------------------------
+# Dependency checks
+# -----------------------------
+require_cmd() { command -v "$1" >/dev/null 2>&1 || { echo "[!] Missing dependency: $1" >&2; exit 1; }; }
+
+require_cmd gobuster
+require_cmd curl
+require_cmd awk
+require_cmd sed
+require_cmd grep
+require_cmd wc
+require_cmd sort
+require_cmd uniq
+require_cmd head
+require_cmd tr
+require_cmd xargs
+require_cmd find
+require_cmd date
+require_cmd seq
+
+if ((BASH_VERSINFO[0] < 4)); then
+  echo "[!] Bash 4+ required (uses 'local -n'). You are on: ${BASH_VERSION:-unknown}" >&2
+  exit 1
+fi
+
+HAS_EXCL_LEN=0
+if gobuster dir --help 2>/dev/null | grep -q -- '--exclude-length'; then
+  HAS_EXCL_LEN=1
+fi
+GOBUSTER_VER="$(gobuster version 2>/dev/null || echo unknown)"
+
+# -----------------------------
+# Helpers
+# -----------------------------
+prompt_yn() {
+  local msg="$1"
+  local ans
+  while true; do
+    read -r -p "$msg [y/n]: " ans
+    case "${ans,,}" in
+      y|yes) return 0 ;;
+      n|no)  return 1 ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
+}
+
+sanitize_name() {
+  echo "$1" | sed -E 's#https?://##; s#[^A-Za-z0-9._-]#_#g'
+}
+
+sanitize_id() {
+  # Keep it filename-safe and not empty
+  local in="$1"
+  in="$(echo "$in" | tr -d '\r\n' | sed -E 's/[^A-Za-z0-9._-]+/_/g; s/^_+|_+$//g')"
+  [ -z "$in" ] && in="scan"
+  echo "$in"
+}
+
+is_int() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
+
+timeout_to_seconds() {
+  # Accepts "10s" or "10"
+  local t="${1:-10s}"
+  t="${t%s}"
+  if is_int "$t"; then echo "$t"; else echo "10"; fi
+}
+
+extract_status() {
+  echo "$1" | sed -nE 's/.*\(Status: ([0-9]{3})\).*/\1/p'
+}
+
+extract_url() {
+  echo "$1" | awk '{print $1}'
+}
+
+extract_size() {
+  echo "$1" | sed -nE 's/.*\[(Size|Length): ([0-9]+)\].*/\2/p'
+}
+
+split_results() {
+  local raw="$1"
+  local outdir="$2"
+  local prefix="$3"
+
+  mkdir -p "$outdir"
+
+  local f_all="$outdir/${prefix}_ALL.txt"
+  local f_2xx="$outdir/${prefix}_2xx.txt"
+  local f_3xx="$outdir/${prefix}_3xx.txt"
+  local f_401403="$outdir/${prefix}_401_403.txt"
+  local f_other="$outdir/${prefix}_OTHER.txt"
+
+  : > "$f_all"; : > "$f_2xx"; : > "$f_3xx"; : > "$f_401403"; : > "$f_other"
+
+  grep -E '\(Status: [0-9]{3}\)' "$raw" | while read -r line; do
+    local st url sz
+    st="$(extract_status "$line")"
+    url="$(extract_url "$line")"
+    sz="$(extract_size "$line")"
+    [ -z "$sz" ] && sz="NA"
+    printf "%s\t%s\t%s\n" "$st" "$sz" "$url" >> "$f_all"
+
+    case "$st" in
+      200|201|202|203|204|205|206) printf "%s\t%s\t%s\n" "$st" "$sz" "$url" >> "$f_2xx" ;;
+      301|302|303|307|308)       printf "%s\t%s\t%s\n" "$st" "$sz" "$url" >> "$f_3xx" ;;
+      401|403)                   printf "%s\t%s\t%s\n" "$st" "$sz" "$url" >> "$f_401403" ;;
+      *)                         printf "%s\t%s\t%s\n" "$st" "$sz" "$url" >> "$f_other" ;;
+    esac
+  done
+}
+
+make_summary() {
+  local base="$1"
+  local outfile="$2"
+  {
+    echo "Summary for: $base"
+    echo "Generated: $(date -Is)"
+    echo
+    find "$base" -maxdepth 5 -type f -name "*.txt" | sort | while read -r f; do
+      local n
+      n="$(wc -l < "$f" | tr -d ' ')"
+      printf "%6s  %s\n" "$n" "${f#$base/}"
+    done
+  } > "$outfile"
+}
+
+# Curl base opts built after auth/proxy/headers are known
+CURL_BASE_OPTS=(-sk)
+build_curl_base_opts() {
+  CURL_BASE_OPTS=(-sk)
+  [ -n "${PROXY:-}" ] && CURL_BASE_OPTS+=(--proxy "$PROXY")
+  if [ -n "${BASIC_USER:-}" ] && [ -n "${BASIC_PASS:-}" ]; then
+    CURL_BASE_OPTS+=(-u "${BASIC_USER}:${BASIC_PASS}")
+  fi
+  if [ -n "${COOKIE_STR:-}" ]; then
+    CURL_BASE_OPTS+=(-b "$COOKIE_STR")
+  fi
+  if [ "${#HEADERS[@]:-0}" -gt 0 ]; then
+    for h in "${HEADERS[@]}"; do CURL_BASE_OPTS+=(-H "$h"); done
+  fi
+}
+
+# -----------------------------
+# Wordlist discovery + selection
+# -----------------------------
+DIR_PREF_THOROUGH=(
+  "/usr/share/seclists/Discovery/Web-Content/raft-large-directories-lowercase.txt"
+  "/usr/share/seclists/Discovery/Web-Content/raft-large-directories.txt"
+  "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-big.txt"
+  "/usr/share/wordlists/dirb/big.txt"
+)
+DIR_PREF_BALANCED=(
+  "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories-lowercase.txt"
+  "/usr/share/seclists/Discovery/Web-Content/raft-medium-directories.txt"
+  "/usr/share/seclists/Discovery/Web-Content/directory-list-2.3-medium.txt"
+  "/usr/share/wordlists/dirbuster/directory-list-2.3-medium.txt"
+  "/usr/share/wordlists/dirb/common.txt"
+)
+DIR_PREF_QUICK=(
+  "/usr/share/wordlists/dirb/common.txt"
+  "/usr/share/seclists/Discovery/Web-Content/raft-small-directories-lowercase.txt"
+  "/usr/share/seclists/Discovery/Web-Content/raft-small-directories.txt"
+  "/usr/share/wordlists/dirbuster/directory-list-2.3-small.txt"
+)
+
+FILE_PREF_THOROUGH=(
+  "/usr/share/seclists/Discovery/Web-Content/raft-large-files-lowercase.txt"
+  "/usr/share/seclists/Discovery/Web-Content/raft-large-files.txt"
+)
+FILE_PREF_BALANCED=(
+  "/usr/share/seclists/Discovery/Web-Content/raft-medium-files-lowercase.txt"
+  "/usr/share/seclists/Discovery/Web-Content/raft-medium-files.txt"
+)
+FILE_PREF_QUICK=(
+  "/usr/share/seclists/Discovery/Web-Content/raft-small-files-lowercase.txt"
+  "/usr/share/seclists/Discovery/Web-Content/raft-small-files.txt"
+)
+
+FILE_FALLBACKS=(
+  "/usr/share/wordlists/dirb/common.txt"
+  "/usr/share/wordlists/dirb/big.txt"
+)
+
+list_found_wordlists() {
+  local -n arr="$1"
+  local found=()
+  for p in "${arr[@]}"; do
+    [ -f "$p" ] && found+=("$p")
+  done
+  printf "%s\n" "${found[@]}"
+}
+
+pick_first_existing() {
+  local -n arr="$1"
+  for p in "${arr[@]}"; do
+    if [ -f "$p" ]; then
+      echo "$p"
+      return 0
+    fi
+  done
+  return 1
+}
+
+menu_select_wordlist() {
+  local title="$1"; shift
+  local candidates=("$@")
+  local i=1
+
+  echo
+  echo "$title"
+  for p in "${candidates[@]}"; do
+    local lines="?"
+    lines="$(wc -l < "$p" 2>/dev/null | tr -d ' ' || true)"
+    printf "  [%d] %s (lines: %s)\n" "$i" "$p" "${lines:-?}"
+    i=$((i+1))
+  done
+  echo "  [0] Enter custom path"
+  echo
+
+  local choice
+  read -r -p "Select: " choice
+  if [ "$choice" = "0" ]; then
+    local custom
+    read -r -p "Custom wordlist path: " custom
+    if [ -f "$custom" ]; then
+      echo "$custom"
+      return 0
+    fi
+    echo "[!] Not found: $custom" >&2
+    return 1
+  fi
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#candidates[@]}" ]; then
+    echo "${candidates[$((choice-1))]}"
+    return 0
+  fi
+
+  echo "[!] Invalid selection" >&2
+  return 1
+}
+
+auto_select_dir_wordlist() {
+  case "$PROFILE" in
+    thorough) pick_first_existing DIR_PREF_THOROUGH && return 0 ;;
+    balanced) pick_first_existing DIR_PREF_BALANCED && return 0 ;;
+    quick)    pick_first_existing DIR_PREF_QUICK && return 0 ;;
+  esac
+  pick_first_existing DIR_PREF_BALANCED || pick_first_existing DIR_PREF_QUICK || pick_first_existing DIR_PREF_THOROUGH
+}
+
+auto_select_file_wordlist() {
+  case "$PROFILE" in
+    thorough) pick_first_existing FILE_PREF_THOROUGH && return 0 ;;
+    balanced) pick_first_existing FILE_PREF_BALANCED && return 0 ;;
+    quick)    pick_first_existing FILE_PREF_QUICK && return 0 ;;
+  esac
+  pick_first_existing FILE_PREF_BALANCED || pick_first_existing FILE_PREF_QUICK || pick_first_existing FILE_PREF_THOROUGH || pick_first_existing FILE_FALLBACKS
+}
+
+# -----------------------------
+# WAF-safe auto-throttle
+# -----------------------------
+AUTO_THROTTLE=1
+maybe_throttle() {
+  local raw="$1"
+  local stage="$2"
+
+  [ "$AUTO_THROTTLE" -eq 1 ] || return 0
+  [ -f "$raw" ] || return 0
+
+  local total rl pct old new tsec
+  total="$(grep -cE '\(Status: [0-9]{3}\)' "$raw" 2>/dev/null || echo 0)"
+  rl="$(grep -cE '\(Status: (429|503)\)' "$raw" 2>/dev/null || echo 0)"
+
+  if (( total == 0 )); then return 0; fi
+  pct=$(( rl * 100 / total ))
+
+  # Trigger if >=20% of findings are 429/503, or >20 absolute
+  if (( pct >= 20 || rl >= 20 )); then
+    old="$THREADS"
+    new=$(( THREADS / 2 ))
+    (( new < 5 )) && new=5
+
+    if (( new < old )); then
+      echo "[!] Possible rate limiting/WAF during '$stage' (429/503 = $rl/$total = ${pct}%)."
+      echo "    Auto-throttle: threads $old -> $new for subsequent scans."
+      THREADS="$new"
+
+      # Increase timeout to at least 15s
+      tsec="$(timeout_to_seconds "$TIMEOUT")"
+      if (( tsec < 15 )); then
+        TIMEOUT="15s"
+        echo "    Auto-throttle: timeout -> $TIMEOUT"
+      fi
+
+      {
+        echo "AUTO_THROTTLE: stage=$stage rl=$rl total=$total pct=${pct}% threads $old->$THREADS timeout=$TIMEOUT"
+      } >> "$META"
+    fi
+  fi
+}
+
+# -----------------------------
+# Gobuster runner (captures exit codes)
+# -----------------------------
+INSECURE_TLS=1
+
+run_gobuster_dir() {
+  # Args: url wordlist out_raw add_slash(0/1) exts(optional) discover_backup(0/1)
+  local url="$1"
+  local wlist="$2"
+  local out_raw="$3"
+  local add_slash="$4"
+  local exts="${5:-}"
+  local discover_backup="${6:-0}"
+
+  local cmd=(gobuster dir
+    -u "$url"
+    -w "$wlist"
+    -t "$THREADS"
+    --timeout "$TIMEOUT"
+    -e -l -r -z -q
+    -s "$STATUS_CODES"
+  )
+
+  (( INSECURE_TLS == 1 )) && cmd+=(-k)
+  [ "$add_slash" -eq 1 ] && cmd+=(-f)
+  [ -n "$exts" ] && cmd+=(-x "$exts")
+  [ "$discover_backup" -eq 1 ] && cmd+=(-d)
+
+  if [ -n "${BASIC_USER:-}" ] && [ -n "${BASIC_PASS:-}" ]; then
+    cmd+=(-U "$BASIC_USER" -P "$BASIC_PASS")
+  fi
+  if [ -n "${COOKIE_STR:-}" ]; then
+    cmd+=(-c "$COOKIE_STR")
+  fi
+  if [ "${#HEADERS[@]}" -gt 0 ]; then
+    for h in "${HEADERS[@]}"; do cmd+=(-H "$h"); done
+  fi
+  [ -n "${PROXY:-}" ] && cmd+=(-p "$PROXY")
+
+  if [ -n "${EXCL_LEN:-}" ]; then
+    if ((HAS_EXCL_LEN==1)); then
+      cmd+=(--exclude-length "$EXCL_LEN")
+    else
+      echo "[!] gobuster lacks --exclude-length; will post-filter by size." >&2
+    fi
+  fi
+
+  echo "[*] Running: ${cmd[*]}"
+  printf "%s\n" "${cmd[*]}" >> "$CMDLOG"
+
+  set +e
+  "${cmd[@]}" | tee "$out_raw" >/dev/null
+  local rc=${PIPESTATUS[0]}
+  set -e
+
+  if (( rc != 0 )); then
+    echo "[!] gobuster exited non-zero (rc=$rc). Check: $out_raw" >&2
+    echo "GOBUSTER_ERROR: rc=$rc stage_output=$out_raw" >> "$META"
+  fi
+
+  if [ -n "${EXCL_LEN:-}" ] && ((HAS_EXCL_LEN==0)); then
+    sed -i -E "/\[(Size|Length): ${EXCL_LEN}\]/d" "$out_raw" || true
+  fi
+
+  maybe_throttle "$out_raw" "gobuster:$out_raw"
+}
+
+# -----------------------------
+# Quick checks (HEAD)
+# -----------------------------
+run_quick_checks() {
+  local outfile="$1"
+  {
+    echo "[*] Quick checks (HEAD where possible):"
+    for p in "robots.txt" "sitemap.xml" ".well-known/security.txt" ".git/HEAD" ".env"; do
+      echo
+      echo "=== ${TARGET}${p} ==="
+      curl "${CURL_BASE_OPTS[@]}" -I --max-time 10 "${TARGET}${p}" 2>/dev/null || true
+    done
+  } > "$outfile" || true
+}
+
+# -----------------------------
+# Seed/crawl: robots + sitemap + optional katana/gospider
+# -----------------------------
+strip_to_wordlist() {
+  # stdin: URLs or paths -> stdout: relative paths suitable for gobuster wordlist
+  # removes scheme+host, strips query/fragment, removes leading slash, drops empty
+  sed -E 's#https?://[^/]+##; s/[?#].*$//; s#^/##; /^\s*$/d' | \
+    sed -E 's#//+#/#g' | \
+    sort -u
+}
+
+seed_from_robots_and_sitemap() {
+  local outdir="$1"
+  local robots_body="$outdir/${ID}_robots_body.txt"
+  local sitemap_body="$outdir/${ID}_sitemap_body.txt"
+  local seed_raw="$outdir/${ID}_seed_raw.txt"
+  local seed_wl="$outdir/${ID}_seed_wordlist.txt"
+
+  : > "$seed_raw"
+
+  # robots.txt body (Allow/Disallow + Sitemap lines)
+  curl "${CURL_BASE_OPTS[@]}" --max-time 15 "${TARGET}robots.txt" 2>/dev/null | tee "$robots_body" >/dev/null || true
+  # Extract Allow/Disallow paths
+  awk -F: 'tolower($1) ~ /^(allow|disallow)$/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); if($2!="") print $2}' "$robots_body" >> "$seed_raw" || true
+  # Extract Sitemap URLs
+  awk -F: 'tolower($1) ~ /^sitemap$/ {gsub(/^[ \t]+|[ \t]+$/,"",$2); if($2!="") print $2}' "$robots_body" >> "$seed_raw" || true
+
+  # sitemap.xml body (we’ll try; if huge, curl may truncate depending on server—still useful)
+  curl "${CURL_BASE_OPTS[@]}" --max-time 20 "${TARGET}sitemap.xml" 2>/dev/null | tee "$sitemap_body" >/dev/null || true
+  # Extract <loc> URLs/paths
+  grep -Eoi '<loc>[^<]+' "$sitemap_body" 2>/dev/null | sed -E 's#<loc>##I' >> "$seed_raw" || true
+
+  # Normalize to wordlist
+  cat "$seed_raw" | strip_to_wordlist > "$seed_wl" || true
+
+  echo "$seed_wl"
+}
+
+augment_seed_with_crawler() {
+  local outdir="$1"
+  local seed_wl="$2"
+  local urls_out="$outdir/${ID}_crawl_urls.txt"
+  local merged="$outdir/${ID}_seed_wordlist_merged.txt"
+
+  local crawler=""
+  command -v katana >/dev/null 2>&1 && crawler="katana"
+  if [ -z "$crawler" ] && command -v gospider >/dev/null 2>&1; then crawler="gospider"; fi
+
+  if [ -z "$crawler" ]; then
+    echo "[*] No crawler tool found (katana/gospider). Skipping crawler augmentation."
+    echo "$seed_wl"
+    return 0
+  fi
+
+  echo "[*] Using crawler: $crawler"
+  : > "$urls_out"
+
+  if [ "$crawler" = "katana" ]; then
+    # Keep options conservative for compatibility across versions
+    # -silent: URLs only, -u: target
+    # depth options vary by version; keep minimal to avoid breakage.
+    set +e
+    katana -u "$TARGET" -silent 2>/dev/null | tee "$urls_out" >/dev/null
+    set -e
+  else
+    # gospider output is noisy; extract URLs
+    set +e
+    gospider -s "$TARGET" -d 2 -c 5 -t 10 --quiet 2>/dev/null | grep -Eo 'https?://[^ ]+' | tee "$urls_out" >/dev/null
+    set -e
+  fi
+
+  # Merge crawler URLs into seed wordlist
+  {
+    cat "$seed_wl"
+    cat "$urls_out" | strip_to_wordlist
+  } | sort -u > "$merged" || true
+
+  echo "$merged"
+}
+
+# -----------------------------
+# Login redirect detection (sample Location)
+# -----------------------------
+check_login_redirects() {
+  local f3xx="$1"
+  local sample_n="${2:-10}"
+  local out="$3"
+
+  [ -f "$f3xx" ] || return 0
+
+  : > "$out"
+  awk -F'\t' '{print $3}' "$f3xx" | head -n "$sample_n" | while read -r u; do
+    [ -z "$u" ] && continue
+    loc="$(curl "${CURL_BASE_OPTS[@]}" -I --max-time 10 "$u" 2>/dev/null | awk -F': ' 'tolower($1)=="location"{print $2}' | tr -d '\r' | head -n1)"
+    echo "$u -> ${loc:-NO_LOCATION}" >> "$out"
+  done
+
+  local hits total
+  hits="$(grep -Eic '/login|/signin|/auth|/oauth' "$out" 2>/dev/null || true)"
+  total="$(wc -l < "$out" | tr -d ' ' || echo 0)"
+
+  if (( total > 0 )) && (( hits*100/total >= 60 )); then
+    echo "[!] Many redirects look like login/auth ($hits/$total in sample)."
+    echo "    Consider supplying cookie/header auth and rerunning scans."
+  fi
+}
+
+# -----------------------------
+# Deep candidate builder
+# -----------------------------
+build_deep_candidates() {
+  local allfile="$1"
+  local outcand="$2"
+  : > "$outcand"
+  awk -F'\t' '$1==401 || $1==403 {print $3}' "$allfile" >> "$outcand" || true
+  awk -F'\t' '$1>=200 && $1<300 {print $3}' "$allfile" >> "$outcand" || true
+  awk -F'\t' '$1>=300 && $1<400 {print $3}' "$allfile" >> "$outcand" || true
+  grep -E '/$' "$outcand" | sort -u > "${outcand}.tmp" || true
+  mv "${outcand}.tmp" "$outcand"
+}
+
+# -----------------------------
+# IMPORTANT consolidator
+# -----------------------------
+build_important() {
+  local base="$1"
+  local important="$2"
+  : > "$important"
+
+  find "$base" -type f -name "*_401_403.txt" -print0 2>/dev/null | xargs -0 cat 2>/dev/null | awk -F'\t' 'NF{print $3}' >> "$important" || true
+  find "$base" -type f -name "*interesting_files.txt" -print0 2>/dev/null | xargs -0 cat 2>/dev/null >> "$important" || true
+  find "$base" -type f -name "*_2xx.txt" -print0 2>/dev/null | xargs -0 cat 2>/dev/null | awk -F'\t' 'NF{print $3}' >> "$important" || true
+
+  sort -u "$important" -o "$important" || true
+}
+
+# -----------------------------
+# Inputs (ID first)
+# -----------------------------
+if [ -n "$ID_ARG" ]; then
+  ID="$(sanitize_id "$ID_ARG")"
+else
+  if ((NONINTERACTIVE==1)); then
+    echo "[!] --non-interactive requires --id" >&2
+    exit 1
+  fi
+  read -r -p "Scan ID (prefix for all output files, e.g. ACME-01): " ID
+  ID="$(sanitize_id "$ID")"
+fi
+
+if [ -n "$TARGET_ARG" ]; then
+  TARGET="$TARGET_ARG"
+else
+  if ((NONINTERACTIVE==1)); then
+    echo "[!] --non-interactive requires --target" >&2
+    exit 1
+  fi
+  read -r -p "Target URL (e.g. https://example.com or example.com): " TARGET
+fi
+
+# Normalize scheme if missing
+if [[ "$TARGET" != http*://* ]]; then
+  for scheme in https http; do
+    if curl -sk -o /dev/null --max-time 5 -I "${scheme}://${TARGET}" >/dev/null 2>&1; then
+      TARGET="${scheme}://${TARGET}"
+      break
+    fi
+  done
+fi
+TARGET="${TARGET%/}/"
+
+if [ -n "$PROFILE_ARG" ]; then
+  PROFILE="$PROFILE_ARG"
+else
+  if ((NONINTERACTIVE==0)); then
+    read -r -p "Profile (quick|balanced|thorough) [balanced]: " PROFILE || true
+    PROFILE="${PROFILE:-balanced}"
+  else
+    PROFILE="balanced"
+  fi
+fi
+case "$PROFILE" in quick|balanced|thorough) : ;; *) PROFILE="balanced" ;; esac
+
+# Defaults / prompts
+if ((NONINTERACTIVE==0)); then
+  read -r -p "Threads (default 50): " THREADS || true
+  THREADS="${THREADS:-50}"
+  is_int "$THREADS" || THREADS=50
+
+  read -r -p "Timeout (default 10s): " TIMEOUT || true
+  TIMEOUT="${TIMEOUT:-10s}"
+
+  read -r -p "Status codes to include (default 200,204,301,302,307,308,401,403): " STATUS_CODES || true
+  STATUS_CODES="${STATUS_CODES:-200,204,301,302,307,308,401,403}"
+
+  read -r -p "Proxy (optional, e.g. http://127.0.0.1:8080) or blank: " PROXY || true
+  PROXY="${PROXY:-}"
+
+  read -r -p "Host header override (vhost) or blank: " VHOST || true
+  VHOST="${VHOST:-}"
+
+  if prompt_yn "Enable WAF-safe auto-throttle on 429/503?"; then
+    AUTO_THROTTLE=1
+  else
+    AUTO_THROTTLE=0
+  fi
+else
+  THREADS="${THREADS:-50}"; is_int "$THREADS" || THREADS=50
+  TIMEOUT="${TIMEOUT:-10s}"
+  STATUS_CODES="${STATUS_CODES:-200,204,301,302,307,308,401,403}"
+  PROXY="${PROXY:-}"
+  VHOST="${VHOST:-}"
+  AUTO_THROTTLE="${AUTO_THROTTLE:-1}"
+fi
+
+# Auth selection
+BASIC_USER=""; BASIC_PASS=""; COOKIE_STR=""; HEADERS=()
+AUTH_MODE="${AUTH_MODE:-none}"
+
+if [ -n "$VHOST" ]; then
+  HEADERS+=("Host: $VHOST")
+fi
+
+if ((NONINTERACTIVE==0)); then
+  echo "Auth mode: none / basic / cookie / header"
+  read -r -p "Choose auth mode (default none): " AUTH_MODE || true
+  AUTH_MODE="${AUTH_MODE:-none}"
+
+  case "${AUTH_MODE,,}" in
+    basic)
+      read -r -p "Basic username: " BASIC_USER
+      read -r -s -p "Basic password: " BASIC_PASS; echo
+      ;;
+    cookie)
+      read -r -p "Cookie file path (optional; Enter to skip): " COOKIE_FILE || true
+      COOKIE_FILE="${COOKIE_FILE:-}"
+      if [ -n "$COOKIE_FILE" ] && [ -f "$COOKIE_FILE" ]; then
+        COOKIE_STR="$(tr -d '\r\n' < "$COOKIE_FILE")"
+      else
+        echo "Paste cookie string (e.g. session=abc; csrftoken=def)."
+        read -r -p "Cookie: " COOKIE_STR
+      fi
+      COOKIE_STR="$(echo -n "$COOKIE_STR" | tr -d '\r\n')"
+      ;;
+    header)
+      echo "Enter headers one per line (blank line to finish). Example: Authorization: Bearer <token>"
+      while true; do
+        read -r -p "Header: " h
+        [ -z "$h" ] && break
+        HEADERS+=("$h")
+      done
+      ;;
+    none) : ;;
+    *) echo "[!] Unknown auth mode; proceeding without auth." ;;
+  esac
+fi
+
+# Build curl base opts now that auth/proxy/headers are known
+build_curl_base_opts
+
+RUN_DIR="gobuster_run_${ID}_$(date +%Y%m%d_%H%M%S)_$(sanitize_name "$TARGET")"
+mkdir -p "$RUN_DIR"
+echo "[*] Output directory: $RUN_DIR"
+
+CMDLOG="$RUN_DIR/${ID}_commands.log"
+META="$RUN_DIR/${ID}_metadata.txt"
+SUMMARY="$RUN_DIR/${ID}_SUMMARY.txt"
+IMPORTANT="$RUN_DIR/${ID}_IMPORTANT.txt"
+: > "$CMDLOG"
+
+{
+  echo "ID: $ID"
+  echo "Target: $TARGET"
+  echo "Profile: $PROFILE"
+  echo "Threads: $THREADS"
+  echo "Timeout: $TIMEOUT"
+  echo "Status codes: $STATUS_CODES"
+  echo "Proxy: ${PROXY:-NONE}"
+  echo "VHost: ${VHOST:-NONE}"
+  echo "Auth mode: ${AUTH_MODE:-none}"
+  echo "Auto-throttle: $AUTO_THROTTLE"
+  echo "Gobuster version: $GOBUSTER_VER"
+  echo "Gobuster supports --exclude-length: $HAS_EXCL_LEN"
+} > "$META"
+
+# Always produce summary/important at exit
+on_exit() {
+  make_summary "$RUN_DIR" "$SUMMARY" || true
+  build_important "$RUN_DIR" "$IMPORTANT" || true
+}
+trap on_exit EXIT
+
+# -----------------------------
+# Step 0: Baseline (multi-sample + mode)
+# -----------------------------
+BASE_DIR="$RUN_DIR/00_baseline"
+mkdir -p "$BASE_DIR"
+BASELINE_SAMPLES="$BASE_DIR/${ID}_baseline_samples.txt"
+BASELINE_MODE="$BASE_DIR/${ID}_baseline_mode.txt"
+: > "$BASELINE_SAMPLES"
+
+baseline_probe() {
+  local url="$1"
+  curl "${CURL_BASE_OPTS[@]}" -o /dev/null -w "%{http_code} %{size_download}\n" --max-time 10 "$url" 2>/dev/null || echo "000 0"
+}
+
+SAMPLES=5
+for _ in $(seq 1 $SAMPLES); do
+  rp="this_should_not_exist_$RANDOM$RANDOM"
+  res="$(baseline_probe "$TARGET$rp")"
+  printf "%s %s\n" "$TARGET$rp" "$res" >> "$BASELINE_SAMPLES"
+done
+
+echo "[*] Baseline samples saved: $BASELINE_SAMPLES"
+MODE_BYTES="$(awk '{print $3}' "$BASELINE_SAMPLES" | sort | uniq -c | sort -nr | head -n1 | awk '{print $2}')"
+MODE_HTTP="$(awk '{print $2}' "$BASELINE_SAMPLES" | sort | uniq -c | sort -nr | head -n1 | awk '{print $2}')"
+UNIQUE_BYTES="$(awk '{print $3}' "$BASELINE_SAMPLES" | sort -u | wc -l | tr -d ' ')"
+
+{
+  echo "MODE_HTTP: $MODE_HTTP"
+  echo "MODE_BYTES: $MODE_BYTES"
+  echo "UNIQUE_BYTES: $UNIQUE_BYTES"
+} > "$BASELINE_MODE"
+
+EXCL_LEN=""
+if ((NONINTERACTIVE==0)); then
+  if (( UNIQUE_BYTES <= 2 )); then
+    if prompt_yn "Use MODE_BYTES=$MODE_BYTES as exclude-length (reduces wildcard noise)?"; then
+      EXCL_LEN="$MODE_BYTES"
+      echo "Exclude length: $EXCL_LEN" >> "$META"
+    fi
+  else
+    echo "[!] Baseline BYTES varied ($UNIQUE_BYTES unique). Custom 404/wildcard likely."
+  fi
+else
+  if (( UNIQUE_BYTES <= 2 )); then EXCL_LEN="$MODE_BYTES"; fi
+fi
+
+QC="$BASE_DIR/${ID}_quick_checks.txt"
+run_quick_checks "$QC"
+echo "[*] Quick checks saved: $QC"
+
+# -----------------------------
+# Step 0b: Seed crawling (robots/sitemap + optional katana/gospider)
+# -----------------------------
+CRAWL_DIR="$RUN_DIR/00_crawl"
+mkdir -p "$CRAWL_DIR"
+
+SEED_WL="$(seed_from_robots_and_sitemap "$CRAWL_DIR")"
+echo "[*] Seed wordlist from robots/sitemap: $SEED_WL"
+
+MERGED_WL="$SEED_WL"
+if ((NONINTERACTIVE==0)); then
+  if prompt_yn "Augment seed wordlist with a crawler (katana/gospider) if available?"; then
+    MERGED_WL="$(augment_seed_with_crawler "$CRAWL_DIR" "$SEED_WL")"
+    echo "[*] Seed wordlist (merged): $MERGED_WL"
+  fi
+
+  if [ -s "$MERGED_WL" ] && prompt_yn "Run a quick gobuster scan using the seed wordlist (fast/high-signal)?"; then
+    SEED_SCAN_DIR="$CRAWL_DIR/seed_scan"
+    mkdir -p "$SEED_SCAN_DIR"
+    RAW="$SEED_SCAN_DIR/${ID}_seed_gobuster_raw.txt"
+    # No -f (add-slash) here to avoid breaking file-like paths; seed list can contain full paths.
+    run_gobuster_dir "$TARGET" "$MERGED_WL" "$RAW" 0 "" 0
+    split_results "$RAW" "$SEED_SCAN_DIR" "${ID}_seed"
+  fi
+fi
+
+# -----------------------------
+# Wordlist selection (auto + optional manual override)
+# -----------------------------
+AUTO_DIR_WL="$(auto_select_dir_wordlist || true)"
+AUTO_FILE_WL="$(auto_select_file_wordlist || true)"
+
+echo
+echo "[*] Auto-selected directory wordlist (profile=$PROFILE): ${AUTO_DIR_WL:-NONE}"
+echo "[*] Auto-selected file wordlist (profile=$PROFILE):      ${AUTO_FILE_WL:-NONE}"
+echo
+
+if [ -z "${AUTO_DIR_WL:-}" ] || [ ! -f "$AUTO_DIR_WL" ]; then
+  echo "[!] No directory wordlist found in common Kali/SecLists locations." >&2
+  ((NONINTERACTIVE==1)) && exit 1
+fi
+if [ -z "${AUTO_FILE_WL:-}" ] || [ ! -f "$AUTO_FILE_WL" ]; then
+  echo "[!] No file wordlist found in common Kali/SecLists locations." >&2
+  ((NONINTERACTIVE==1)) && exit 1
+fi
+
+if ((NONINTERACTIVE==0)) && prompt_yn "Manually choose/override wordlists from what exists on disk?"; then
+  mapfile -t DIR_EXISTING < <( { list_found_wordlists DIR_PREF_QUICK; list_found_wordlists DIR_PREF_BALANCED; list_found_wordlists DIR_PREF_THOROUGH; } | awk 'NF' | sort -u )
+  mapfile -t FILE_EXISTING < <( { list_found_wordlists FILE_PREF_QUICK; list_found_wordlists FILE_PREF_BALANCED; list_found_wordlists FILE_PREF_THOROUGH; list_found_wordlists FILE_FALLBACKS; } | awk 'NF' | sort -u )
+
+  if [ "${#DIR_EXISTING[@]}" -gt 0 ]; then
+    AUTO_DIR_WL="$(menu_select_wordlist "Select directory wordlist:" "${DIR_EXISTING[@]}")"
+  else
+    read -r -p "Custom directory wordlist path: " AUTO_DIR_WL
+  fi
+
+  if [ "${#FILE_EXISTING[@]}" -gt 0 ]; then
+    AUTO_FILE_WL="$(menu_select_wordlist "Select file wordlist:" "${FILE_EXISTING[@]}")"
+  else
+    read -r -p "Custom file wordlist path: " AUTO_FILE_WL
+  fi
+fi
+
+WLIST_DIR="$AUTO_DIR_WL"
+WLIST_FILES="$AUTO_FILE_WL"
+
+if [ -z "${WLIST_DIR:-}" ] || [ ! -f "$WLIST_DIR" ]; then
+  echo "[!] Directory wordlist missing/invalid. Exiting." >&2
+  exit 1
+fi
+if [ -z "${WLIST_FILES:-}" ] || [ ! -f "$WLIST_FILES" ]; then
+  echo "[!] File wordlist missing/invalid. Exiting." >&2
+  exit 1
+fi
+
+{
+  echo "Dir wordlist: $WLIST_DIR"
+  echo "File wordlist: $WLIST_FILES"
+  echo "Exclude length: ${EXCL_LEN:-NONE}"
+  echo "Seed wordlist: $SEED_WL"
+  echo "Merged seed wordlist: $MERGED_WL"
+} >> "$META"
+
+if ((NONINTERACTIVE==0)); then
+  read -r -p "Extensions for file scan (default php,html,js,json,txt,xml,yml,yaml,conf,config,ini,log,bak,old,zip,tar,gz,7z,sql,env): " EXTS || true
+  EXTS="${EXTS:-php,html,js,json,txt,xml,yml,yaml,conf,config,ini,log,bak,old,zip,tar,gz,7z,sql,env}"
+else
+  EXTS="${EXTS:-php,html,js,json,txt,xml,yml,yaml,conf,config,ini,log,bak,old,zip,tar,gz,7z,sql,env}"
+fi
+
+# -----------------------------
+# Step 1: Directory scan (nginx-friendly add-slash)
+# -----------------------------
+DO_DIRS=1
+if ((NONINTERACTIVE==0)) && ! prompt_yn "Run directory scan now?"; then DO_DIRS=0; fi
+
+if ((DO_DIRS==1)); then
+  DIR_DIR="$RUN_DIR/01_dirs"
+  mkdir -p "$DIR_DIR"
+  RAW="$DIR_DIR/${ID}_dirs_raw.txt"
+
+  run_gobuster_dir "$TARGET" "$WLIST_DIR" "$RAW" 1 "" 0
+  split_results "$RAW" "$DIR_DIR" "${ID}_dirs"
+
+  check_login_redirects "$DIR_DIR/${ID}_dirs_3xx.txt" 10 "$DIR_DIR/${ID}_redirect_locations_sample.txt"
+
+  FOUND_COUNT="$(wc -l < "$DIR_DIR/${ID}_dirs_ALL.txt" | tr -d ' ' || echo 0)"
+  if [ "$PROFILE" != "thorough" ] && [ "$FOUND_COUNT" -lt 10 ] && ((NONINTERACTIVE==0)); then
+    if prompt_yn "Only $FOUND_COUNT findings. Escalate directory scan to a larger wordlist (if available)?"; then
+      BIGGER="$(pick_first_existing DIR_PREF_THOROUGH || true)"
+      if [ -n "${BIGGER:-}" ] && [ "$BIGGER" != "$WLIST_DIR" ]; then
+        RAW2="$DIR_DIR/${ID}_dirs_raw_thorough.txt"
+        run_gobuster_dir "$TARGET" "$BIGGER" "$RAW2" 1 "" 0
+        split_results "$RAW2" "$DIR_DIR" "${ID}_dirs_thorough"
+      else
+        echo "[!] No larger directory list found (or already using it)."
+      fi
+    fi
+  fi
+else
+  echo "[*] Skipping directory scan."
+fi
+
+# -----------------------------
+# Step 1b: Deep scan discovered directories
+# -----------------------------
+DEEP_BASE="$RUN_DIR/deep"
+mkdir -p "$DEEP_BASE"
+
+DO_DEEP=0
+if [ -f "$RUN_DIR/01_dirs/${ID}_dirs_ALL.txt" ]; then
+  if ((NONINTERACTIVE==0)); then
+    prompt_yn "Shall I look further into discovered directories (deep scan)?" && DO_DEEP=1
+  fi
+fi
+
+if ((DO_DEEP==1)); then
+  CAND="$RUN_DIR/01_dirs/${ID}_discovered_dirs.txt"
+  build_deep_candidates "$RUN_DIR/01_dirs/${ID}_dirs_ALL.txt" "$CAND"
+
+  TOTAL_DIRS="$(wc -l < "$CAND" | tr -d ' ' || echo 0)"
+  echo "[*] Discovered $TOTAL_DIRS prioritized candidate directories."
+
+  read -r -p "Max number of directories to deep scan (default 20): " MAX_DEEP || true
+  MAX_DEEP="${MAX_DEEP:-20}"
+
+  DEEP_WL="$(pick_first_existing DIR_PREF_BALANCED || echo "$WLIST_DIR")"
+  if [ "$PROFILE" = "thorough" ] && prompt_yn "Use thorough wordlist for deep scans (can be noisy/slow)?"; then
+    DEEP_WL="$(pick_first_existing DIR_PREF_THOROUGH || echo "$WLIST_DIR")"
+  fi
+
+  head -n "$MAX_DEEP" "$CAND" | while read -r d; do
+    [ -z "$d" ] && continue
+    OUTD="$DEEP_BASE/$(sanitize_name "$d")"
+    mkdir -p "$OUTD"
+    RAWD="$OUTD/${ID}_deep_dirs_raw.txt"
+    run_gobuster_dir "$d" "$DEEP_WL" "$RAWD" 1 "" 0
+    split_results "$RAWD" "$OUTD" "${ID}_deep_dirs"
+  done
+else
+  echo "[*] Skipping deep scan."
+fi
+
+# -----------------------------
+# Step 2: File + extensions scan
+# -----------------------------
+DO_FILES=1
+if ((NONINTERACTIVE==0)) && ! prompt_yn "Run file/extensions scan now?"; then DO_FILES=0; fi
+
+if ((DO_FILES==1)); then
+  FILE_DIR="$RUN_DIR/02_files"
+  mkdir -p "$FILE_DIR"
+  RAWF="$FILE_DIR/${ID}_files_raw.txt"
+
+  run_gobuster_dir "$TARGET" "$WLIST_FILES" "$RAWF" 0 "$EXTS" 1
+  split_results "$RAWF" "$FILE_DIR" "${ID}_files"
+
+  INTERESTING="$FILE_DIR/${ID}_interesting_files.txt"
+  awk -F'\t' '{print $3}' "$FILE_DIR/${ID}_files_ALL.txt" | \
+    grep -Ei '(\.env$|\.ya?ml$|\.ini$|\.conf$|\.config$|\.log$|\.sql$|\.bak$|\.old$|\.zip$|\.tar$|\.gz$|\.7z$|\.map$|/admin|/debug|/internal|/swagger|/openapi)' \
+    | sort -u > "$INTERESTING" || true
+
+  FOUND_FILES="$(wc -l < "$FILE_DIR/${ID}_files_ALL.txt" | tr -d ' ' || echo 0)"
+  if [ "$PROFILE" != "thorough" ] && [ "$FOUND_FILES" -lt 10 ] && ((NONINTERACTIVE==0)); then
+    if prompt_yn "Only $FOUND_FILES file findings. Escalate to a larger file wordlist (if available)?"; then
+      BIG_FILES="$(pick_first_existing FILE_PREF_THOROUGH || true)"
+      if [ -n "${BIG_FILES:-}" ] && [ "$BIG_FILES" != "$WLIST_FILES" ]; then
+        RAW2="$FILE_DIR/${ID}_files_raw_thorough.txt"
+        run_gobuster_dir "$TARGET" "$BIG_FILES" "$RAW2" 0 "$EXTS" 1
+        split_results "$RAW2" "$FILE_DIR" "${ID}_files_thorough"
+      else
+        echo "[!] No larger file list found (or already using it)."
+      fi
+    fi
+  fi
+else
+  echo "[*] Skipping file scan."
+fi
+
+# Final artifacts (trap will also do it)
+make_summary "$RUN_DIR" "$SUMMARY" || true
+build_important "$RUN_DIR" "$IMPORTANT" || true
+
+echo
+echo "[*] Done. Key outputs:"
+echo "    - $SUMMARY"
+echo "    - $IMPORTANT"
+echo "    - $CMDLOG"
+echo "    - $META"
+echo "[*] Review order: *_401_403.txt -> $IMPORTANT -> *_interesting_files.txt -> *_2xx.txt -> *_3xx.txt"
