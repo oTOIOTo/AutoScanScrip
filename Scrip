@@ -44,7 +44,7 @@ while [[ $# -gt 0 ]]; do
     --profile) PROFILE_ARG="${2:-}"; shift 2 ;;
     --non-interactive) NONINTERACTIVE=1; shift ;;
     --) shift; break ;;
-    *) break ;;
+    *) echo "[!] Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
 
@@ -184,7 +184,7 @@ split_results() {
 
   : > "$f_all"; : > "$f_2xx"; : > "$f_3xx"; : > "$f_401403"; : > "$f_other"
 
-  grep -E '\(Status: [0-9]{3}\)' "$raw" | while read -r line; do
+  while read -r line; do
     local st url sz
     st="$(extract_status "$line")"
     url="$(extract_url "$line")"
@@ -198,7 +198,7 @@ split_results() {
       401|403)                   printf "%s\t%s\t%s\n" "$st" "$sz" "$url" >> "$f_401403" ;;
       *)                         printf "%s\t%s\t%s\n" "$st" "$sz" "$url" >> "$f_other" ;;
     esac
-  done
+  done < <(grep -E '\(Status: [0-9]{3}\)' "$raw" || true)
 }
 
 make_summary() {
@@ -345,6 +345,43 @@ auto_select_file_wordlist() {
   pick_first_existing FILE_PREF_BALANCED || pick_first_existing FILE_PREF_QUICK || pick_first_existing FILE_PREF_THOROUGH || pick_first_existing FILE_FALLBACKS
 }
 
+
+create_fallback_wordlist() {
+  local mode="$1" out="$2"
+  mkdir -p "$(dirname "$out")"
+
+  if [ "$mode" = "dir" ]; then
+    cat > "$out" <<'EOF'
+admin
+api
+assets
+backup
+blog
+cdn
+config
+dashboard
+files
+images
+js
+login
+media
+public
+uploads
+EOF
+  else
+    cat > "$out" <<'EOF'
+index
+robots
+sitemap
+login
+admin
+config
+backup
+.env
+EOF
+  fi
+}
+
 # -----------------------------
 # WAF-safe auto-throttle
 # -----------------------------
@@ -355,8 +392,10 @@ maybe_throttle() {
   [ -f "$raw" ] || return 0
 
   local total rl pct old new tsec
-  total="$(grep -cE '\(Status: [0-9]{3}\)' "$raw" 2>/dev/null || echo 0)"
-  rl="$(grep -cE '\(Status: (429|503)\)' "$raw" 2>/dev/null || echo 0)"
+  total="$(grep -cE '\(Status: [0-9]{3}\)' "$raw" 2>/dev/null || true)"
+  rl="$(grep -cE '\(Status: (429|503)\)' "$raw" 2>/dev/null || true)"
+  total="${total:-0}"
+  rl="${rl:-0}"
   (( total == 0 )) && return 0
   pct=$(( rl * 100 / total ))
 
@@ -510,7 +549,8 @@ check_login_redirects() {
   : > "$out"
   awk -F'\t' '{print $3}' "$f3xx" | head -n "$sample_n" | while read -r u; do
     [ -z "$u" ] && continue
-    loc="$(curl "${CURL_BASE_OPTS[@]}" -I --max-time 10 "$u" 2>/dev/null | awk -F': ' 'tolower($1)=="location"{print $2}' | tr -d '\r' | head -n1)"
+    local loc
+    loc="$(curl "${CURL_BASE_OPTS[@]}" -I --max-time 10 "$u" 2>/dev/null | awk -F': ' 'tolower($1)=="location"{print $2}' | tr -d '\r' | head -n1 || true)"
     echo "$u -> ${loc:-NO_LOCATION}" >> "$out"
   done
   local hits total
@@ -779,11 +819,15 @@ echo
 
 if [ -z "${AUTO_DIR_WL:-}" ] || [ ! -f "$AUTO_DIR_WL" ]; then
   echo "[!] No directory wordlist found in common Kali/SecLists locations." >&2
-  ((NONINTERACTIVE==1)) && exit 1
+  AUTO_DIR_WL="$RUN_DIR/00_wordlists/${ID}_fallback_dirs.txt"
+  create_fallback_wordlist dir "$AUTO_DIR_WL"
+  echo "[*] Generated fallback directory wordlist: $AUTO_DIR_WL"
 fi
 if [ -z "${AUTO_FILE_WL:-}" ] || [ ! -f "$AUTO_FILE_WL" ]; then
   echo "[!] No file wordlist found in common Kali/SecLists locations." >&2
-  ((NONINTERACTIVE==1)) && exit 1
+  AUTO_FILE_WL="$RUN_DIR/00_wordlists/${ID}_fallback_files.txt"
+  create_fallback_wordlist file "$AUTO_FILE_WL"
+  echo "[*] Generated fallback file wordlist: $AUTO_FILE_WL"
 fi
 
 WLIST_DIR="$AUTO_DIR_WL"
